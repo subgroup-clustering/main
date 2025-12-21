@@ -25,7 +25,8 @@ from src.DRSFC.DRSFC import DRSFC
 
 def parse_args():
     parser = argparse.ArgumentParser(description='DRSFC Hyperparameter Tuning')
-    parser.add_argument('--data_name', type=str, required=True)
+    parser.add_argument('--data_name', type=str, default=None)
+    parser.add_argument('--dataset', dest='data_name', type=str, help='Alias for --data_name')
     parser.add_argument('--data_dir', type=str, default=None)
     parser.add_argument('--K', type=int, default=None, help='Single K value')
     parser.add_argument('--K_min', type=int, default=2)
@@ -36,16 +37,87 @@ def parse_args():
     parser.add_argument('--lr_max', type=float, default=0.1)
     parser.add_argument('--lambda_min', type=float, default=0.001)
     parser.add_argument('--lambda_max', type=float, default=100)
-    parser.add_argument('--max_iter_min', type=int, default=100)
-    parser.add_argument('--max_iter_max', type=int, default=500)
+    parser.add_argument('--epochs_min', dest='epochs_min', type=int, default=100)
+    parser.add_argument('--epochs_max', dest='epochs_max', type=int, default=500)
     parser.add_argument('--n_trials', type=int, default=300)
     parser.add_argument('--timeout', type=int, default=None)
     parser.add_argument('--target_value', type=float, default=None)
+    parser.add_argument('--target', dest='target_value', type=float, default=None,
+                        help='Alias for --target_value')
     parser.add_argument('--objective', type=str, default='subgroup',
                         choices=['marginal', 'subgroup', 'wmp'])
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--n_disc_steps', type=int, default=5)
-    return parser.parse_args()
+
+    # Structural options
+    # If you pass ONE value -> fixed.
+    # If you pass MULTIPLE values -> Optuna will choose among them per trial.
+    parser.add_argument(
+        '--assignment_type',
+        nargs='+',
+        default=['nn_dist'],
+        choices=['nn', 'distance', 'nn_dist'],
+        help=(
+            'Assignment type search space. Provide one value to fix it, or multiple values to tune over them. '
+            'Examples: --assignment_type distance  |  --assignment_type nn_dist distance'
+        )
+    )
+    parser.add_argument(
+        '--center_update',
+        nargs='+',
+        default=['mstep'],
+        choices=['mstep', 'sgd'],
+        help=(
+            'Center update search space. Provide one value to fix it, or multiple values to tune over them. '
+            'Example: --center_update mstep'
+        )
+    )
+    parser.add_argument(
+        '--center_init',
+        nargs='+',
+        default=['k-means++'],
+        choices=['k-means++', 'random'],
+        help=(
+            'Center init search space. Provide one value to fix it, or multiple values to tune over them. '
+            'Example: --center_init k-means++'
+        )
+    )
+
+    parser.add_argument(
+        '--fixed_assignment_type',
+        type=str,
+        default=None,
+        choices=['nn', 'distance', 'nn_dist'],
+        help='(Deprecated) Use --assignment_type <value> instead.'
+    )
+    parser.add_argument(
+        '--fixed_center_update',
+        type=str,
+        default=None,
+        choices=['mstep', 'sgd'],
+        help='(Deprecated) Use --center_update <value> instead.'
+    )
+    parser.add_argument(
+        '--fixed_center_init',
+        type=str,
+        default=None,
+        choices=['k-means++', 'random'],
+        help='(Deprecated) Use --center_init <value> instead.'
+    )
+
+    args = parser.parse_args()
+    if not args.data_name:
+        parser.error('one of --data_name or --dataset is required')
+
+    # Apply deprecated fixed_* overrides if provided
+    if args.fixed_assignment_type is not None:
+        args.assignment_type = [args.fixed_assignment_type]
+    if args.fixed_center_update is not None:
+        args.center_update = [args.fixed_center_update]
+    if args.fixed_center_init is not None:
+        args.center_init = [args.fixed_center_init]
+
+    return args
 
 
 def get_device():
@@ -72,7 +144,25 @@ def objective(trial):
     
     lr = trial.suggest_float('lr', _args.lr_min, _args.lr_max, log=True)
     lambda_fair = trial.suggest_float('lambda_fair', _args.lambda_min, _args.lambda_max, log=True)
-    max_iter = trial.suggest_int('max_iter', _args.max_iter_min, _args.max_iter_max, step=50)
+    # We keep the Optuna parameter name 'max_iter' for continuity in stored studies,
+    # but it represents the number of training epochs.
+    max_iter = trial.suggest_int('max_iter', _args.epochs_min, _args.epochs_max, step=50)
+
+    # Structural options: if user provided ONE value, fix it; if multiple, tune over that subset.
+    if len(_args.assignment_type) == 1:
+        assignment_type = _args.assignment_type[0]
+    else:
+        assignment_type = trial.suggest_categorical('assignment_type', _args.assignment_type)
+
+    if len(_args.center_update) == 1:
+        center_update = _args.center_update[0]
+    else:
+        center_update = trial.suggest_categorical('center_update', _args.center_update)
+
+    if len(_args.center_init) == 1:
+        center_init = _args.center_init[0]
+    else:
+        center_init = trial.suggest_categorical('center_init', _args.center_init)
     
     np.random.seed(_args.seed)
     torch.manual_seed(_args.seed)
@@ -89,13 +179,19 @@ def objective(trial):
             verbose=False,
             random_state=_args.seed,
             device=_device,
+            assignment_type=assignment_type,
+            center_update=center_update,
+            center_init=center_init,
         )
         model.fit(_X, _S)
         cluster_ids = model.labels_
         soft_assignments = model.assignment_probs_
+        centers = model.get_centers()
         
-        # Store cluster_ids
+        # Store results for best trial retrieval
         trial.set_user_attr('cluster_ids', cluster_ids.tolist())
+        trial.set_user_attr('soft_assignments', soft_assignments.tolist())
+        trial.set_user_attr('centers', centers.tolist())
         
         # Compute metrics
         metrics = compute_all(_X, _y, _S, cluster_ids, _current_K, soft_assignments)
@@ -172,23 +268,36 @@ def run_tuning_for_K(K, args, X, y, S, device):
     print("-"*50)
     print(f"  lr:          {best.params['lr']:.6f}")
     print(f"  lambda_fair: {best.params['lambda_fair']:.4f}")
-    print(f"  max_iter:    {best.params['max_iter']}")
+    print(f"  epochs:      {best.params['max_iter']}")
+    if 'assignment_type' in best.params:
+        print(f"  assignment:  {best.params['assignment_type']}")
+    if 'center_update' in best.params:
+        print(f"  center_upd:  {best.params['center_update']}")
+    if 'center_init' in best.params:
+        print(f"  center_init: {best.params['center_init']}")
     print()
     for m in ['Cost', 'MarginalBalance', 'SubgroupBalance', 'Delta', 'MP1', 'MP2', 'SP']:
         v = best.user_attrs.get(m, 'N/A')
         print(f"  {m}: {v}")
     
-    # Retrieve cluster_ids from best trial
+    # Retrieve results from best trial
     cluster_ids = np.array(best.user_attrs['cluster_ids'], dtype=np.int32)
+    soft_assignments = np.array(best.user_attrs['soft_assignments'], dtype=np.float32)
+    centers = np.array(best.user_attrs['centers'], dtype=np.float32)
     
     # Save
     save_dir = f"results/{args.data_name}_tune_{args.objective}/K_{K}"
     os.makedirs(save_dir, exist_ok=True)
     
+    # Cluster results (best trial)
     np.save(f"{save_dir}/cluster_ids.npy", cluster_ids)
-    np.save(f"{save_dir}/cluster_input.npy", X)
-    np.save(f"{save_dir}/cluster_label.npy", y)
-    np.save(f"{save_dir}/cluster_sensitives.npy", S)
+    np.save(f"{save_dir}/soft_assignments.npy", soft_assignments)
+    np.save(f"{save_dir}/centers.npy", centers)
+    
+    # Data (for reproducibility)
+    np.save(f"{save_dir}/X.npy", X)
+    np.save(f"{save_dir}/y.npy", y)
+    np.save(f"{save_dir}/S.npy", S.values if hasattr(S, 'values') else S)
     
     # best_config.json
     best_config = {
@@ -197,7 +306,10 @@ def run_tuning_for_K(K, args, X, y, S, device):
         'objective': args.objective,
         'lr': best.params['lr'],
         'lambda_fair': best.params['lambda_fair'],
-        'max_iter': best.params['max_iter'],
+        'epochs': best.params['max_iter'],
+        'assignment_type': best.params.get('assignment_type', None),
+        'center_update': best.params.get('center_update', None),
+        'center_init': best.params.get('center_init', None),
         'gamma': args.gamma,
         'max_order': args.max_order,
         'seed': args.seed,
@@ -224,7 +336,7 @@ def run_tuning_for_K(K, args, X, y, S, device):
                 'trial': trial.number,
                 'lr': trial.params['lr'],
                 'lambda_fair': trial.params['lambda_fair'],
-                'max_iter': trial.params['max_iter'],
+                'epochs': trial.params['max_iter'],
                 'Cost': trial.user_attrs.get('Cost'),
                 'MarginalBalance': trial.user_attrs.get('MarginalBalance'),
                 'SubgroupBalance': trial.user_attrs.get('SubgroupBalance'),

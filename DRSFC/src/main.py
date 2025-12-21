@@ -15,6 +15,14 @@ Usage:
 """
 
 import argparse
+import sys
+from pathlib import Path
+
+# Allow running as a script from inside src/ (e.g., `python main.py ...`).
+# This adds the project root so that `import src...` works.
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 parser = argparse.ArgumentParser(description='DRSFC')
 
@@ -25,6 +33,9 @@ parser.add_argument('--seed', default=42, type=int, help='Random seed')
 parser.add_argument('--data_name', default='adult(2)', type=str, help='Dataset name')
 parser.add_argument('--data_dir', default=None, type=str, help='Data directory override')
 
+# Backward-compatible alias
+parser.add_argument('--dataset', dest='data_name', type=str, help='Alias for --data_name')
+
 # Clustering
 parser.add_argument('--K', default=5, type=int, help='Number of clusters')
 
@@ -34,13 +45,26 @@ parser.add_argument('--gamma', default=0.01, type=float, help='Minimum subgroup 
 parser.add_argument('--max_order', default=2, type=int, help='Maximum interaction order for subgroups')
 
 # Training
-parser.add_argument('--max_iter', default=200, type=int, help='Maximum iterations')
+parser.add_argument('--epochs', dest='epochs', default=200, type=int, help='Number of training epochs')
 parser.add_argument('--lr', default=0.01, type=float, help='Learning rate')
-parser.add_argument('--n_disc_steps', default=5, type=int, help='Discriminator steps per iteration')
+parser.add_argument('--n_disc_steps', default=5, type=int, help='Discriminator steps per epoch')
+
+# Center update and assignment type
+parser.add_argument('--center_update', default='mstep', type=str, choices=['sgd', 'mstep'],
+                    help='How to update centers: sgd or mstep (closed-form, recommended)')
+parser.add_argument('--assignment_type', default='nn_dist', type=str, choices=['nn', 'distance', 'nn_dist'],
+                    help='Assignment type: nn (neural net, x only), distance (softmax of -dist), nn_dist (neural net with distances, recommended)')
+
+# Center initialization
+parser.add_argument('--center_init', default='k-means++', type=str, choices=['k-means++', 'random'],
+                    help='KMeans init method for initial centers: k-means++ (default) or random')
+parser.add_argument('--init_centers_path', default=None, type=str,
+                    help='Optional path to a numpy .npy file containing initial centers (K,d). If provided, it overrides --center_init.')
 
 # Options
 parser.add_argument('--unfair', action='store_true', help='Use baseline K-Means (unfair)')
-parser.add_argument('--use_cuda', action='store_true', help='Use GPU if available')
+parser.add_argument('--use_cuda', action='store_true', help='(Deprecated) Use GPU if available (GPU is auto by default)')
+parser.add_argument('--cpu', action='store_true', help='Force CPU even if CUDA is available')
 parser.add_argument('--verbose', action='store_true', help='Verbose output')
 
 args = parser.parse_args()

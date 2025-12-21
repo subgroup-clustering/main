@@ -63,12 +63,26 @@ def build_C_matrix(S, gamma=0.01, max_order=2, device="cuda"):
 
 
 class AssignmentNet(nn.Module):
-    """Soft cluster assignment network. Input: x_i, Output: A_ik."""
+    """
+    Soft cluster assignment network.
     
-    def __init__(self, n_features, n_clusters, hidden_dim=64, init_tau=1.0, min_tau=0.1):
+    Modes:
+        - "nn": A = f(x) - only sees x
+        - "nn_dist": A = f(x, d(x,μ)) - sees x and distances to centers
+    """
+    
+    def __init__(self, n_features, n_clusters, hidden_dim=64, init_tau=1.0, min_tau=0.1, mode="nn"):
         super().__init__()
+        self.mode = mode
+        self.n_clusters = n_clusters
+        
+        if mode == "nn":
+            input_dim = n_features
+        else:  # "nn_dist"
+            input_dim = n_features + n_clusters
+        
         self.net = nn.Sequential(
-            nn.Linear(n_features, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -81,8 +95,21 @@ class AssignmentNet(nn.Module):
     def tau(self):
         return self.min_tau + torch.exp(self._log_tau)
     
-    def forward(self, X):
-        logits = self.net(X)
+    def forward(self, X, centers=None):
+        """
+        Args:
+            X: (n, d) data points
+            centers: (K, d) cluster centers (required if mode="nn_dist")
+        Returns:
+            A: (n, K) soft assignments
+        """
+        if self.mode == "nn":
+            features = X
+        else:  # "nn_dist"
+            distances = torch.sqrt(((X.unsqueeze(1) - centers.unsqueeze(0)) ** 2).sum(dim=2) + 1e-8)
+            features = torch.cat([X, distances], dim=1)
+        
+        logits = self.net(features)
         return torch.softmax(logits / self.tau, dim=1)
 
 
@@ -123,12 +150,40 @@ class DRSFC:
     """
     Doubly Regressing Subgroup Fair Clustering.
     
-    Objective: min_{A,mu} max_{g,v} L_cluster + lambda * L_fair
+    Objective: min_{A,mu} max_{g,v} L_cluster - lambda * L_fair
     """
     
     def __init__(self, n_clusters=5, lambda_fair=1.0, gamma=0.01, max_order=2,
                  hidden_dim=1024, lr=0.01, n_disc_steps=5, max_iter=200,
-                 random_state=42, verbose=True, device="auto"):
+                 random_state=42, verbose=True, device="auto",
+                 center_update="mstep", assignment_type="nn_dist",
+                 center_init="k-means++", init_centers=None):
+        """
+        Args:
+            n_clusters: Number of clusters K.
+            lambda_fair: Fairness regularization weight.
+            gamma: Minimum subgroup proportion for C matrix.
+            max_order: Maximum interaction order for subgroups.
+            hidden_dim: Hidden dimension for networks.
+            lr: Learning rate.
+            n_disc_steps: Number of discriminator/v steps per epoch (inner loop).
+            max_iter: Number of training epochs.
+            random_state: Random seed.
+            verbose: Whether to print progress.
+            device: Device to use ("auto", "cpu", or "cuda:X").
+            center_update: How to update centers.
+                - "sgd": Update via gradient descent (original, unstable).
+                - "mstep": Closed-form M-step (recommended).
+            assignment_type: How to compute soft assignments A.
+                - "nn": A = f_θ(x) - neural net that only sees x (prone to collapse).
+                - "distance": A = softmax(-||x-μ||²/τ) - no learnable function.
+                - "nn_dist": A = f_θ(x, d(x,μ)) - neural net sees x AND distances (recommended).
+            center_init: KMeans init strategy for initializing centers when init_centers is not given.
+                - "k-means++": k-means++ seeding (sklearn default)
+                - "random": random points seeding
+            init_centers: Optional initial centers. Either a numpy array (K,d) or a torch tensor (K,d).
+                If provided, it overrides center_init and no KMeans initialization is run.
+        """
         self.n_clusters = n_clusters
         self.lambda_fair = lambda_fair
         self.gamma = gamma
@@ -139,6 +194,10 @@ class DRSFC:
         self.max_iter = max_iter
         self.random_state = random_state
         self.verbose = verbose
+        self.center_update = center_update
+        self.assignment_type = assignment_type
+        self.center_init = center_init
+        self.init_centers = init_centers
         self.device = torch.device(
             "cuda" if device == "auto" and torch.cuda.is_available() 
             else device if device != "auto" else "cpu"
@@ -169,30 +228,70 @@ class DRSFC:
         
         X_t = torch.tensor(X, dtype=torch.float32, device=self.device)
         
-        # Init with K-Means
-        km = KMeans(n_clusters=K, n_init=10, random_state=self.random_state)
-        km.fit(X)
-        self.centers_ = nn.Parameter(
-            torch.tensor(km.cluster_centers_, dtype=torch.float32, device=self.device)
-        )
+        # Initialize centers μ
+        if self.init_centers is not None:
+            init = self.init_centers
+            if isinstance(init, torch.Tensor):
+                init_centers = init.detach().to(self.device).to(torch.float32)
+            else:
+                init_centers = torch.tensor(np.asarray(init, dtype=np.float32), device=self.device)
+            if init_centers.ndim != 2 or init_centers.shape[0] != K or init_centers.shape[1] != d:
+                raise ValueError(
+                    f"init_centers must have shape (K,d)=({K},{d}), got {tuple(init_centers.shape)}"
+                )
+            self.centers_ = nn.Parameter(init_centers)
+        else:
+            km = KMeans(
+                n_clusters=K,
+                init=self.center_init,
+                n_init=10,
+                random_state=self.random_state,
+            )
+            km.fit(X)
+            self.centers_ = nn.Parameter(
+                torch.tensor(km.cluster_centers_, dtype=torch.float32, device=self.device)
+            )
         
-        # Init networks
-        self.assignment_net_ = AssignmentNet(d, K, self.hidden_dim).to(self.device)
+        # Init networks based on assignment_type
+        if self.assignment_type in ("nn", "nn_dist"):
+            self.assignment_net_ = AssignmentNet(
+                d, K, self.hidden_dim, mode=self.assignment_type
+            ).to(self.device)
+        else:  # "distance"
+            self.assignment_net_ = None
+            self._log_tau = nn.Parameter(torch.tensor(0.0, device=self.device))
+        
         self.discriminator_ = Discriminator(16).to(self.device)
         self.v_ = nn.Parameter(torch.randn(self.M_, device=self.device))
         with torch.no_grad():
             self.v_.data = self.v_.data / (self.v_.data.norm() + 1e-8)
         
-        # Optimizers
-        opt_main = optim.Adam(
-            list(self.assignment_net_.parameters()) + [self.centers_], 
-            lr=self.lr
-        )
+        # Optimizers setup based on center_update and assignment_type
+        if self.assignment_type in ("nn", "nn_dist"):
+            main_params = list(self.assignment_net_.parameters())
+        else:
+            main_params = [self._log_tau]
+        
+        if self.center_update == "sgd":
+            main_params = main_params + [self.centers_]
+        
+        opt_main = optim.Adam(main_params, lr=self.lr)
         opt_disc = optim.Adam(self.discriminator_.parameters(), lr=self.lr)
         opt_v = optim.Adam([self.v_], lr=self.lr)
         
         self.history_ = {"cluster_loss": [], "fair_loss": [], "total_loss": []}
         iterator = tqdm(range(self.max_iter), desc="DRSFC") if self.verbose else range(self.max_iter)
+        
+        def compute_A(X_t):
+            """Compute soft assignments based on assignment_type."""
+            if self.assignment_type == "nn":
+                return self.assignment_net_(X_t, None)
+            elif self.assignment_type == "nn_dist":
+                return self.assignment_net_(X_t, self.centers_)
+            else:  # "distance"
+                tau = 0.1 + torch.exp(self._log_tau)
+                sq_dist = ((X_t.unsqueeze(1) - self.centers_.unsqueeze(0)) ** 2).sum(dim=2)
+                return torch.softmax(-sq_dist / tau, dim=1)
         
         for epoch in iterator:
             # Inner loop: maximize L_fair
@@ -201,7 +300,7 @@ class DRSFC:
                     opt_disc.zero_grad()
                     opt_v.zero_grad()
                     with torch.no_grad():
-                        A = self.assignment_net_(X_t)
+                        A = compute_A(X_t)
                     L_fair = fairness_loss(A, C, self.v_, self.discriminator_)
                     L_fair.backward()
                     opt_disc.step()
@@ -211,7 +310,7 @@ class DRSFC:
             
             # Outer loop: minimize L_cluster - lambda * L_fair
             opt_main.zero_grad()
-            A = self.assignment_net_(X_t)
+            A = compute_A(X_t)
             L_cluster = clustering_loss(A, X_t, self.centers_)
             
             if self.lambda_fair > 0 and self.M_ > 0:
@@ -230,12 +329,21 @@ class DRSFC:
             total_loss.backward()
             opt_main.step()
             
+            # M-step: update centers with closed-form solution (only if center_update=="mstep")
+            if self.center_update == "mstep":
+                with torch.no_grad():
+                    A_detached = compute_A(X_t)  # (n, K)
+                    sum_A = A_detached.sum(dim=0)  # (K,)
+                    eps = 1e-8
+                    weighted_X = A_detached.T @ X_t  # (K, d)
+                    self.centers_.data = weighted_X / (sum_A.unsqueeze(1) + eps)
+            
             self.history_["cluster_loss"].append(L_cluster.item())
             self.history_["fair_loss"].append(L_fair.item() if isinstance(L_fair, torch.Tensor) else L_fair)
             self.history_["total_loss"].append(total_loss.item())
         
         with torch.no_grad():
-            A = self.assignment_net_(X_t)
+            A = compute_A(X_t)
             self.labels_ = A.argmax(dim=1).cpu().numpy()
             self.assignment_probs_ = A.cpu().numpy()
         
@@ -245,19 +353,39 @@ class DRSFC:
         return self
     
     def predict(self, X):
+        """Predict cluster labels for new data."""
         X_t = torch.tensor(X, dtype=torch.float32, device=self.device)
         with torch.no_grad():
-            A = self.assignment_net_(X_t)
+            if self.assignment_type == "nn":
+                A = self.assignment_net_(X_t, None)
+            elif self.assignment_type == "nn_dist":
+                A = self.assignment_net_(X_t, self.centers_)
+            else:  # "distance"
+                tau = 0.1 + torch.exp(self._log_tau)
+                sq_dist = ((X_t.unsqueeze(1) - self.centers_.unsqueeze(0)) ** 2).sum(dim=2)
+                A = torch.softmax(-sq_dist / tau, dim=1)
         return A.argmax(dim=1).cpu().numpy()
     
+    def predict_proba(self, X):
+        """Predict soft assignment probabilities for new data."""
+        X_t = torch.tensor(X, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            if self.assignment_type == "nn":
+                A = self.assignment_net_(X_t, None)
+            elif self.assignment_type == "nn_dist":
+                A = self.assignment_net_(X_t, self.centers_)
+            else:  # "distance"
+                tau = 0.1 + torch.exp(self._log_tau)
+                sq_dist = ((X_t.unsqueeze(1) - self.centers_.unsqueeze(0)) ** 2).sum(dim=2)
+                A = torch.softmax(-sq_dist / tau, dim=1)
+        return A.cpu().numpy()
+    
     def get_centers(self):
+        """Get cluster centers."""
         return self.centers_.detach().cpu().numpy()
 
 
-# =============================================================================
 # Runners
-# =============================================================================
-
 def get_device():
     """Get best available device."""
     if not torch.cuda.is_available():
@@ -288,7 +416,13 @@ def runner(args):
     K = args.K if args.K > 0 else K_default
     
     # Device
-    device = get_device() if args.use_cuda else 'cpu'
+    # Default: use GPU when available. You can force CPU with --cpu.
+    force_cpu = bool(getattr(args, 'cpu', False))
+    use_cuda = (not force_cpu) and torch.cuda.is_available()
+    # Backward compatibility: if user explicitly passed --use_cuda, honor it.
+    if getattr(args, 'use_cuda', False):
+        use_cuda = True and (not force_cpu) and torch.cuda.is_available()
+    device = get_device() if use_cuda else 'cpu'
     print(f"\n[2/4] Device: {device}")
     
     # Unfair baseline
@@ -300,6 +434,12 @@ def runner(args):
     
     # DRSFC
     print("\n[3/4] Training DRSFC...")
+
+    init_centers = None
+    init_centers_path = getattr(args, 'init_centers_path', None)
+    if init_centers_path:
+        init_centers = np.load(init_centers_path)
+
     model = DRSFC(
         n_clusters=K,
         lambda_fair=args.lambda_fair,
@@ -307,10 +447,14 @@ def runner(args):
         max_order=args.max_order,
         lr=args.lr,
         n_disc_steps=args.n_disc_steps,
-        max_iter=args.max_iter,
+        max_iter=args.epochs,
         verbose=args.verbose,
         random_state=args.seed,
         device=device,
+        center_update=getattr(args, 'center_update', 'mstep'),
+        assignment_type=getattr(args, 'assignment_type', 'nn'),
+        center_init=getattr(args, 'center_init', 'k-means++'),
+        init_centers=init_centers,
     )
     model.fit(X, S)
     
@@ -331,7 +475,8 @@ def runner(args):
         'gamma': args.gamma,
         'max_order': args.max_order,
         'lr': args.lr,
-        'max_iter': args.max_iter,
+        # Keep key name for backward compatibility with existing scripts
+        'max_iter': args.epochs,
         'seed': args.seed,
     }
     with open(save_dir / "config.json", 'w') as f:
@@ -345,6 +490,11 @@ def runner(args):
     np.save(save_dir / "cluster_ids.npy", model.labels_)
     np.save(save_dir / "soft_assignments.npy", model.assignment_probs_)
     np.save(save_dir / "centers.npy", model.get_centers())
+    
+    # Data (for reproducibility)
+    np.save(save_dir / "X.npy", X)
+    np.save(save_dir / "y.npy", y)
+    np.save(save_dir / "S.npy", S.values if hasattr(S, 'values') else S)
     
     print(f"\nResults saved to: {save_dir}/")
     
@@ -385,6 +535,11 @@ def unfair_runner(args):
     
     np.save(save_dir / "cluster_ids.npy", labels)
     np.save(save_dir / "centers.npy", centers)
+    
+    # Data (for reproducibility)
+    np.save(save_dir / "X.npy", X)
+    np.save(save_dir / "y.npy", y)
+    np.save(save_dir / "S.npy", S.values if hasattr(S, 'values') else S)
     
     print(f"\nResults saved to: {save_dir}/")
     print(f"\n[Result] Cost / Balance: {metrics['Cost']:.4f} / {metrics['SubgroupBalance']:.4f}")
