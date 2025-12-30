@@ -114,21 +114,31 @@ class AssignmentNet(nn.Module):
 
 
 class Discriminator(nn.Module):
-    """Discriminator g(A_ik) for adversarial fairness."""
+    """Discriminator g(A_i) for adversarial fairness.
     
-    def __init__(self, hidden_dim=64):
+    Takes the full K-dimensional assignment vector as input,
+    allowing the discriminator to leverage relationships between cluster assignments.
+    """
+    
+    def __init__(self, n_clusters, hidden_dim=64):
         super().__init__()
+        self.n_clusters = n_clusters
         self.net = nn.Sequential(
-            nn.Linear(1, hidden_dim),
+            nn.Linear(n_clusters, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, 1),  # Output scalar per sample
         )
     
     def forward(self, A):
-        shape = A.shape
-        return self.net(A.view(-1, 1)).view(shape)
+        """
+        Args:
+            A: (n, K) soft assignment matrix
+        Returns:
+            g(A): (n,) scalar output for each sample
+        """
+        return self.net(A).squeeze(-1)
 
 
 def clustering_loss(A, X, centers):
@@ -138,10 +148,21 @@ def clustering_loss(A, X, centers):
 
 
 def fairness_loss(A, C, v, g):
-    """L_fair = sum_i sum_k (v^T c_i - g(A_ik))^2"""
-    vc = C @ v
-    gA = g(A)
-    return ((vc.unsqueeze(1) - gA) ** 2).mean()
+    """
+    L_fair = sum_i (v^T c_i - g(A_i))^2
+    
+    Args:
+        A: (n, K) soft assignment matrix
+        C: (n, M) subgroup indicator matrix
+        v: (M,) learnable weight vector
+        g: Discriminator network that takes (n, K) and outputs (n,)
+    
+    Returns:
+        Scalar fairness loss
+    """
+    vc = C @ v        # (n,) - subgroup encoding for each sample
+    gA = g(A)         # (n,) - discriminator output for each sample
+    return ((vc - gA) ** 2).mean()
 
 
 # DRSFC Model
@@ -261,7 +282,7 @@ class DRSFC:
             self.assignment_net_ = None
             self._log_tau = nn.Parameter(torch.tensor(0.0, device=self.device))
         
-        self.discriminator_ = Discriminator(16).to(self.device)
+        self.discriminator_ = Discriminator(K, 16).to(self.device)
         self.v_ = nn.Parameter(torch.randn(self.M_, device=self.device))
         with torch.no_grad():
             self.v_.data = self.v_.data / (self.v_.data.norm() + 1e-8)
@@ -279,7 +300,13 @@ class DRSFC:
         opt_disc = optim.Adam(self.discriminator_.parameters(), lr=self.lr)
         opt_v = optim.Adam([self.v_], lr=self.lr)
         
-        self.history_ = {"cluster_loss": [], "fair_loss": [], "total_loss": []}
+        self.history_ = {
+            "cluster_loss": [], 
+            "fair_loss": [], 
+            "total_loss": [],
+            "centers": [],
+            "soft_assignments": []
+        }
         iterator = tqdm(range(self.max_iter), desc="DRSFC") if self.verbose else range(self.max_iter)
         
         def compute_A(X_t):
@@ -341,6 +368,12 @@ class DRSFC:
             self.history_["cluster_loss"].append(L_cluster.item())
             self.history_["fair_loss"].append(L_fair.item() if isinstance(L_fair, torch.Tensor) else L_fair)
             self.history_["total_loss"].append(total_loss.item())
+            
+            # Track centers and soft assignments per epoch
+            with torch.no_grad():
+                A_epoch = compute_A(X_t)
+                self.history_["centers"].append(self.centers_.detach().cpu().numpy().copy())
+                self.history_["soft_assignments"].append(A_epoch.cpu().numpy().copy())
         
         with torch.no_grad():
             A = compute_A(X_t)
