@@ -303,7 +303,6 @@ class DRSFC:
             center_init: KMeans init strategy for initializing centers when init_centers is not given.
                 - "k-means++": k-means++ seeding (sklearn default)
                 - "random": random points seeding
-                - "rand_K": randomly select K data points from the dataset as initial centers (no KMeans)
             init_centers: Optional initial centers. Either a numpy array (K,d) or a torch tensor (K,d).
                 If provided, it overrides center_init and no KMeans initialization is run.
             tau: Temperature for softmax in assignment. Fixed value (not learnable).
@@ -410,17 +409,6 @@ class DRSFC:
                 )
             self.centers_ = nn.Parameter(init_centers)
             km_labels = None  # No K-means labels when using init_centers
-        elif self.center_init == "rand_K":
-            # Randomly select K data points from the dataset as initial centers
-            rng = np.random.default_rng(self.random_state)
-            rand_indices = rng.choice(n, size=K, replace=False)
-            init_centers = X_np[rand_indices]
-            self.centers_ = nn.Parameter(
-                torch.tensor(init_centers, dtype=torch.float32, device=self.device)
-            )
-            km_labels = None  # No K-means labels when using rand_K
-            if self.verbose:
-                print(f"[DRSFC] Initialized centers with rand_K: selected {K} random data points")
         else:
             km = KMeans(
                 n_clusters=K,
@@ -486,9 +474,8 @@ class DRSFC:
             # For "distance" mode, tau is also fixed (stored as self.tau)
         
         self.discriminator_ = Discriminator(K, self.hidden_dim).to(self.device)
-        # v 초기화: uniform (1/M) -> sphere 위로 정규화
-        # lr_v=0이면 v가 고정됨
-        self.v_ = nn.Parameter(torch.ones(self.M_, device=self.device) / self.M_)
+        # Initialize v: sample from standard Gaussian, then normalize to unit sphere
+        self.v_ = nn.Parameter(torch.randn(self.M_, device=self.device))
         with torch.no_grad():
             self.v_.data = self.v_.data / (self.v_.data.norm() + 1e-8)
         
