@@ -487,7 +487,7 @@ class DRSFC:
         
         self.discriminator_ = Discriminator(K, self.hidden_dim).to(self.device)
         # v 초기화: uniform (1/M) -> sphere 위로 정규화
-        # lr_v=0이면 v가 고정됨 (김건웅님 제안)
+        # lr_v=0이면 v가 고정됨
         self.v_ = nn.Parameter(torch.ones(self.M_, device=self.device) / self.M_)
         with torch.no_grad():
             self.v_.data = self.v_.data / (self.v_.data.norm() + 1e-8)
